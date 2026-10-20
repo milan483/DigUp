@@ -40,6 +40,8 @@ pub struct Settings {
     /// The model runs on the processor even where the graphics card measured faster (Settings → General): for a card
     /// whose results come back wrong or empty. The helpers get `DIGUP_DEVICE=cpu`.
     pub processor_only: bool,
+    /// Linux defaults to releasing hidden UI and idle search workers. Opt out for faster repeat searches.
+    pub keep_warm: bool,
     /// When DigUp last checked for updates (seconds since 1970).
     pub update_checked: u64,
 }
@@ -70,5 +72,20 @@ impl Settings {
         let temporary = path.with_extension("json.new");
         std::fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(temporary, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_memory_is_default_and_keep_warm_round_trips() {
+        let mut settings: Settings = serde_json::from_str(r#"{"setUp":true}"#).unwrap();
+        assert!(!settings.keep_warm);
+        settings.keep_warm = true;
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["keepWarm"], true);
+        assert!(serde_json::from_value::<Settings>(saved).unwrap().keep_warm);
     }
 }

@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(target_os = "linux")'.dependencies]
 gio = "0.18"
 gtk = "0.18"
+webkit2gtk = { version = "2.0.2", features = ["v2_32"] }
 zbus = "5"
 
 [profile.release]

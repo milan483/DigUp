@@ -479,13 +479,16 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-tauri.event.listen("panel-shown", () => {
+function panelShown() {
   closeBig();
   // Like Spotlight: the last query, selected.
   $query.focus();
   $query.select();
   ask({ op: "prewarm" }).catch(() => {});
-});
+}
+tauri.event.listen("panel-shown", panelShown);
+// A disposable panel may finish loading after the shell's first panel-shown event.
+tauri.window.getCurrentWindow().isVisible().then((visible) => { if (visible) panelShown(); });
 
 tauri.event.listen("helper", ({ payload }) => {
   const { from, event } = payload;

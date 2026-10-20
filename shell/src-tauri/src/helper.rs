@@ -9,12 +9,14 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
+/// Sender and whether its reply resets the interactive idle clock (index maintenance must not).
+type PendingReplies = Arc<Mutex<HashMap<u64, (oneshot::Sender<Value>, bool)>>>;
 
 /// How a helper is started.
 #[derive(Clone)]
@@ -117,6 +119,8 @@ pub struct SearchService {
     running: Arc<Mutex<Option<Searching>>>,
     next_id: AtomicU64,
     on_event: EventSink,
+    folders: Mutex<Option<Value>>,
+    closed: AtomicBool,
 }
 
 struct Searching {
@@ -124,7 +128,8 @@ struct Searching {
     stdin: ChildStdin,
     number: u64,
     /// Replies still to come, by request id. Each process has its own, so one that dies fails only its own requests.
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: PendingReplies,
+    last_reply: Arc<Mutex<Instant>>,
 }
 
 impl SearchService {
@@ -134,6 +139,8 @@ impl SearchService {
             running: Arc::default(),
             next_id: AtomicU64::new(1),
             on_event: Arc::new(on_event),
+            folders: Mutex::new(None),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -151,17 +158,31 @@ impl SearchService {
 
     fn send(&self, id: u64, request: &Value) -> Result<oneshot::Receiver<Value>, String> {
         let mut running = self.running.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("DigUp is quitting".into());
+        }
+        let op = request["op"].as_str().unwrap_or_default();
+        if op == "folders" {
+            *self.folders.lock().unwrap() = Some(request.clone());
+        }
         if let Some(searching) = running.as_mut() {
             if !matches!(searching.child.try_wait(), Ok(None)) {
                 *running = None;
             }
         }
         if running.is_none() {
+            // Background index events must not resurrect a sleeping search worker. A new worker reads the
+            // current index itself; folder changes are replayed before its first request.
+            if op == "reload" || op == "folders" {
+                let (sender, receiver) = oneshot::channel();
+                let _ = sender.send(json!({"ok": true}));
+                return Ok(receiver);
+            }
             *running = Some(self.start()?);
         }
         let searching = running.as_mut().unwrap();
         let (sender, receiver) = oneshot::channel();
-        searching.pending.lock().unwrap().insert(id, sender);
+        searching.pending.lock().unwrap().insert(id, (sender, op != "reload" && op != "folders"));
         if let Err(error) = writeln!(searching.stdin, "{request}").and_then(|_| searching.stdin.flush()) {
             searching.pending.lock().unwrap().remove(&id);
             *running = None;
@@ -171,17 +192,25 @@ impl SearchService {
     }
 
     fn start(&self) -> Result<Searching, String> {
-        let (child, stdin, stdout) = self.launch.spawn()?;
+        let (child, mut stdin, stdout) = self.launch.spawn()?;
+        if let Some(mut folders) = self.folders.lock().unwrap().clone() {
+            folders["id"] = json!(0);
+            let _ = writeln!(stdin, "{folders}").and_then(|_| stdin.flush());
+        }
         let number = STARTED.fetch_add(1, Ordering::Relaxed);
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::default();
+        let pending: PendingReplies = Arc::default();
         let (replies, on_event, slot) = (pending.clone(), self.on_event.clone(), self.running.clone());
+        let last_reply = Arc::new(Mutex::new(Instant::now()));
+        let replied = last_reply.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
                 match message.get("id").and_then(Value::as_u64) {
                     Some(id) => {
-                        if let Some(sender) = replies.lock().unwrap().remove(&id) {
+                        let mut replies = replies.lock().unwrap();
+                        if let Some((sender, interactive)) = replies.remove(&id) {
+                            if interactive { *replied.lock().unwrap() = Instant::now(); }
                             let _ = sender.send(message);
                         }
                     }
@@ -199,13 +228,125 @@ impl SearchService {
             drop(slot);
             on_event(json!({"event": "exit"}));
         });
-        Ok(Searching { child, stdin, number, pending })
+        Ok(Searching { child, stdin, number, pending, last_reply })
+    }
+
+    /// Called off the UI thread. Pending requests (including abandoned callers) pin the worker until its reply.
+    /// Sending and retirement share the slot lock: a request either pins this worker or starts the next one.
+    pub fn retire_idle(&self, timeout: Duration) -> bool {
+        let retiring = {
+            let mut running = self.running.lock().unwrap();
+            let idle = running.as_ref().is_some_and(|searching| {
+                let pending = searching.pending.lock().unwrap();
+                pending.is_empty() && searching.last_reply.lock().unwrap().elapsed() >= timeout
+            });
+            if idle { running.take() } else { None }
+        };
+        if let Some(searching) = retiring {
+            stop(searching.child, searching.stdin, &json!({"op": "quit"}).to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.stop();
     }
 
     pub fn stop(&self) {
         if let Some(searching) = self.running.lock().unwrap().take() {
             stop(searching.child, searching.stdin, &json!({"op": "quit"}).to_string());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod search_lifecycle_tests {
+    use super::*;
+
+    fn service() -> Arc<SearchService> {
+        Arc::new(SearchService::new(Launch {
+            program: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), r#"
+import json, os, sys, time
+folders = []
+for line in sys.stdin:
+    q = json.loads(line)
+    if q['op'] == 'quit': break
+    if q['op'] == 'folders': folders = q['roots']
+    if q['op'] == 'slow': time.sleep(0.15)
+    print(json.dumps({'id': q['id'], 'ok': True, 'pid': os.getpid(), 'roots': folders}), flush=True)
+"#.into()],
+            env: vec![], log: None, background: false,
+        }, |_| {}))
+    }
+
+    #[test]
+    fn retirement_reopens_with_latest_folders_and_shutdown_is_final() {
+        tauri::async_runtime::block_on(async {
+            let search = service();
+            search.ask(json!({"op": "folders", "roots": ["new"]})).await.unwrap();
+            search.ask(json!({"op": "reload"})).await.unwrap();
+            assert!(search.running.lock().unwrap().is_none(), "background events must not start a worker");
+            let first = search.ask(json!({"op": "status"})).await.unwrap();
+            assert_eq!(first["roots"], json!(["new"]));
+            assert!(!search.retire_idle(Duration::from_secs(60)), "a fresh reply cancels expiry");
+            *search.running.lock().unwrap().as_ref().unwrap().last_reply.lock().unwrap() =
+                Instant::now() - Duration::from_secs(60);
+            search.ask(json!({"op": "reload"})).await.unwrap();
+            assert!(search.retire_idle(Duration::from_secs(30)), "index reloads must not keep search warm");
+            search.ask(json!({"op": "status"})).await.unwrap();
+            assert!(search.retire_idle(Duration::ZERO));
+            search.ask(json!({"op": "folders", "roots": ["latest"]})).await.unwrap();
+            let second = search.ask(json!({"op": "status"})).await.unwrap();
+            assert_ne!(first["pid"], second["pid"]);
+            assert_eq!(second["roots"], json!(["latest"]));
+            search.shutdown();
+            assert!(search.ask(json!({"op": "status"})).await.is_err());
+            assert!(search.running.lock().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn requests_racing_retirement_always_get_a_reply() {
+        let search = service();
+        tauri::async_runtime::block_on(search.ask(json!({"op": "status"}))).unwrap();
+        for _ in 0..12 {
+            let retiring = search.clone();
+            let thread = std::thread::spawn(move || retiring.retire_idle(Duration::ZERO));
+            let reply = tauri::async_runtime::block_on(search.ask(json!({"op": "status"}))).unwrap();
+            assert_eq!(reply["ok"], true);
+            thread.join().unwrap();
+        }
+        let pid = tauri::async_runtime::block_on(search.ask(json!({"op": "status"}))).unwrap()["pid"].as_u64().unwrap();
+        search.shutdown();
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn abandoned_in_flight_request_pins_worker_and_does_not_stop_indexer() {
+        let search = service();
+        // send without awaiting: closing the caller's receiver must not make a busy helper disposable.
+        let receiver = search.send(999, &json!({"id": 999, "op": "slow"})).unwrap();
+        drop(receiver);
+        assert!(!search.retire_idle(Duration::ZERO));
+        tauri::async_runtime::block_on(search.ask(json!({"op": "status"}))).unwrap();
+        let index = IndexService::new(|_| {});
+        let launch = Launch { program: "python3".into(), args: vec!["-u".into(), "-c".into(),
+            "import sys\nfor line in sys.stdin:\n if line.strip() == 'stop': break".into()],
+            env: vec![], log: None, background: true };
+        index.run(&launch).unwrap();
+        assert!(search.retire_idle(Duration::ZERO));
+        assert!(matches!(index.running.lock().unwrap().as_mut().unwrap().child.try_wait(), Ok(None)));
+        index.shutdown();
+        assert!(index.run(&launch).is_err());
+        assert!(index.sync_code(&launch).is_err());
+        let model = ModelDownload::new(|_| {});
+        model.shutdown();
+        assert!(model.run(&launch).is_err());
+        search.shutdown();
     }
 }
 
@@ -216,6 +357,7 @@ impl SearchService {
 pub struct IndexService {
     running: Arc<Mutex<Option<Indexing>>>,
     on_event: EventSink,
+    closed: AtomicBool,
 }
 
 struct Indexing {
@@ -229,11 +371,12 @@ struct Indexing {
 
 impl IndexService {
     pub fn new(on_event: impl Fn(Value) + Send + Sync + 'static) -> IndexService {
-        IndexService { running: Arc::default(), on_event: Arc::new(on_event) }
+        IndexService { running: Arc::default(), on_event: Arc::new(on_event), closed: AtomicBool::new(false) }
     }
 
     pub fn run(&self, launch: &Launch) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) { return Err("DigUp is quitting".into()); }
         if let Some(indexing) = running.as_mut() {
             if matches!(indexing.child.try_wait(), Ok(None)) && indexing.args == launch.args {
                 indexing.owed = true;
@@ -276,6 +419,7 @@ impl IndexService {
     pub fn sync_code(&self, launch: &Launch) -> Result<(), String> {
         {
             let mut running = self.running.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) { return Err("DigUp is quitting".into()); }
             if let Some(indexing) = running.as_mut() {
                 if matches!(indexing.child.try_wait(), Ok(None)) && indexing.args == launch.args {
                     return writeln!(indexing.stdin, "sync code").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string());
@@ -283,6 +427,11 @@ impl IndexService {
             }
         }
         self.run(launch)
+    }
+
+    pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.stop();
     }
 
     pub fn stop(&self) {
@@ -297,15 +446,17 @@ impl IndexService {
 pub struct ModelDownload {
     running: Arc<Mutex<Option<(Child, u64)>>>,
     on_event: EventSink,
+    closed: AtomicBool,
 }
 
 impl ModelDownload {
     pub fn new(on_event: impl Fn(Value) + Send + Sync + 'static) -> ModelDownload {
-        ModelDownload { running: Arc::default(), on_event: Arc::new(on_event) }
+        ModelDownload { running: Arc::default(), on_event: Arc::new(on_event), closed: AtomicBool::new(false) }
     }
 
     pub fn run(&self, launch: &Launch) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) { return Err("DigUp is quitting".into()); }
         if let Some((child, _)) = running.as_mut() {
             if matches!(child.try_wait(), Ok(None)) {
                 return Ok(());
@@ -339,6 +490,11 @@ impl ModelDownload {
         });
         *running = Some((child, number));
         Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.stop();
     }
 
     pub fn stop(&self) {

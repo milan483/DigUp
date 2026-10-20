@@ -59,6 +59,8 @@ struct Shell {
     wayland: bool,
     /// The panel's window now: PANEL, or CENTERED_PANEL when it fills the screen.
     panel_label: Mutex<&'static str>,
+    /// Most recent hide/close; low-memory cleanup waits until every page is hidden.
+    ui_hidden: Mutex<Instant>,
     search: SearchService,
     index: IndexService,
     model: ModelDownload,
@@ -470,6 +472,7 @@ fn reveal(app: AppHandle, path: String) -> Result<(), String> {
 fn hide_panel(app: AppHandle) {
     if let Some(panel) = panel_window(&app) {
         let _ = panel.hide();
+        *app.state::<Arc<Shell>>().ui_hidden.lock().unwrap() = Instant::now();
     }
 }
 
@@ -619,6 +622,21 @@ fn main() {
         return;
     }
     let app = tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if !cfg!(target_os = "linux") { return; }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let Some(shell) = window.try_state::<Arc<Shell>>() else { return };
+                if shell.quitting.load(Ordering::SeqCst) || shell.settings.lock().unwrap().keep_warm { return; }
+                // Keep native handles until every page is hidden. WebKit may share their process, so
+                // killing a closing page's process while another is visible would interrupt that page.
+                if let Some(view) = window.app_handle().get_webview_window(window.label()) {
+                    if view.label() == WINDOW { remember_place(&view); }
+                    api.prevent_close();
+                    let _ = view.hide();
+                    *shell.ui_hidden.lock().unwrap() = Instant::now();
+                }
+            }
+        })
         // A second launch (DigUp opened again from the app grid or the Start menu) shows the window, as on the Mac; a
         // desktop shortcut's `--toggle` shows or hides the panel. The window is made once the second launch's message
         // has been answered: on Windows it comes as a message the other process waits on.
@@ -646,7 +664,7 @@ fn main() {
         .setup(move |app| setup(app, options))
         .invoke_handler(tauri::generate_handler![
             ask, estimate, setup_info, pick_folders, apply_setup_folders, finish_setup, open_path, open_code, reveal, hide_panel, panel_height,
-            panel_area, settings_info, set_open_at_login, set_center_panel, set_processor_only, debug_query, debug_report, window_info,
+            panel_area, settings_info, set_open_at_login, set_center_panel, set_processor_only, set_keep_warm, debug_query, debug_report, window_info,
             app_state, open_window, open_settings, choose_folders, index_now, quit_app, close_window, pause_indexing,
             remove_folder, set_skipped, set_skip_types, set_index_hours, code_setup_info, set_code_folders, choose_code_folders,
             remove_code_folder, turn_off_code, set_code_editor, window_resized, copy_file, drag_out, set_hotkey, hold_hotkey,
@@ -729,6 +747,7 @@ fn setup(app: &mut tauri::App, options: Options) -> Result<(), Box<dyn std::erro
         shortcut: hotkey::method(),
         wayland: wayland::active(),
         panel_label: Mutex::new(PANEL),
+        ui_hidden: Mutex::new(Instant::now()),
         search,
         index,
         model,
@@ -760,7 +779,10 @@ fn setup(app: &mut tauri::App, options: Options) -> Result<(), Box<dyn std::erro
         delete_code_index(&shell);
     }
 
-    make_panel(&handle, shell.centers_panel())?;
+    if !cfg!(target_os = "linux") || shell.settings.lock().unwrap().keep_warm || shell.options.debug_query.is_some() {
+        make_panel(&handle, shell.centers_panel())?;
+    }
+    watch_memory(&handle);
     // No tray (a session without a taskbar, a Linux desktop without one): the hotkey and the panel still work.
     if let Err(error) = make_tray(&handle, &shell) {
         eprintln!("digup-shell: no tray icon: {error}");
@@ -949,9 +971,10 @@ fn delete_code_index(shell: &Arc<Shell>) {
 
 fn stop_helpers(app: &AppHandle) {
     let shell = app.state::<Arc<Shell>>();
-    shell.model.stop();
-    shell.index.stop();
-    shell.search.stop();
+    shell.quitting.store(true, Ordering::SeqCst);
+    shell.search.shutdown();
+    shell.model.shutdown();
+    shell.index.shutdown();
 }
 
 fn quit(app: &AppHandle) {
@@ -1011,6 +1034,7 @@ fn panel_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
 fn remake_panel(app: &AppHandle) {
     let shell = app.state::<Arc<Shell>>().inner().clone();
     let old = panel_window(app);
+    if old.is_none() { return; }
     if old.as_ref().is_some_and(|panel| (panel.label() == CENTERED_PANEL) == shell.centers_panel()) {
         return;
     }
@@ -1024,11 +1048,18 @@ fn remake_panel(app: &AppHandle) {
 }
 
 fn show_panel(app: &AppHandle) {
+    if app.state::<Arc<Shell>>().quitting.load(Ordering::SeqCst) { return; }
     if !app.state::<Arc<Shell>>().is_set_up() {
         later(app, |app| {
             let _ = show_setup(app);
         });
         return;
+    }
+    if panel_window(app).is_none() {
+        if let Err(error) = make_panel(app, app.state::<Arc<Shell>>().centers_panel()) {
+            eprintln!("digup-shell: can't make the panel: {error}");
+            return;
+        }
     }
     let Some(panel) = panel_window(app) else { return };
     // On the screen with the pointer, centered, a fifth of the way down: the page puts it there in a window that fills
@@ -1060,7 +1091,7 @@ fn toggle_panel(app: &AppHandle) {
 
 /// The window: searches bigger than the panel (kind filters, a grid of pictures, the preview beside it), the home
 /// DigUp opens to by hand, and its menu (Choose Folders, Index Now, Settings, Quit) where a desktop has no tray. It's
-/// made when it opens and gone when it closes, so a closed window costs nothing. A search the panel hands over is in
+/// made when it opens and released on close (after the idle grace period in Linux low-memory mode). A search the panel hands over is in
 /// `window_search`: a new window takes it as it loads, an open one is told.
 fn show_window(app: &AppHandle) -> tauri::Result<()> {
     let shell = app.state::<Arc<Shell>>().inner().clone();
@@ -1214,6 +1245,8 @@ fn settings_info(app: AppHandle, shell: State<'_, Arc<Shell>>) -> Value {
         "canOpenAtLogin": shell.opens_at_login(),
         "centered": shell.settings.lock().unwrap().center_panel,
         "processorOnly": settings.processor_only,
+        "canKeepWarm": cfg!(target_os = "linux"),
+        "keepWarm": settings.keep_warm,
         // Windows' tray reports clicks (Linux's open the menu, a Mac's too).
         "canChooseTrayClick": cfg!(windows),
         "trayClick": if settings.tray_click == "panel" { "panel" } else { "window" },
@@ -1569,6 +1602,45 @@ fn set_processor_only(app: AppHandle, shell: State<'_, Arc<Shell>>, on: bool) ->
 }
 
 #[tauri::command]
+fn set_keep_warm(shell: State<'_, Arc<Shell>>, on: bool) -> Result<(), String> {
+    let mut settings = shell.settings.lock().unwrap();
+    settings.keep_warm = on;
+    settings.save(&shell.settings_path).map_err(|error| error.to_string())
+}
+
+/// Keep the tray, hotkeys and indexing alive, not an invisible browser and search worker. All window decisions
+/// happen on the main thread, so a reopen cannot race the hidden-pages check and destruction.
+fn watch_memory(app: &AppHandle) {
+    if !cfg!(target_os = "linux") { return; }
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let shell = app.state::<Arc<Shell>>();
+        if shell.quitting.load(Ordering::SeqCst) { break; }
+        if shell.settings.lock().unwrap().keep_warm { continue; }
+        shell.search.retire_idle(Duration::from_secs(30));
+        later(&app, |app| {
+            let shell = app.state::<Arc<Shell>>();
+            if shell.quitting.load(Ordering::SeqCst) || shell.settings.lock().unwrap().keep_warm { return; }
+            if shell.ui_hidden.lock().unwrap().elapsed() < Duration::from_secs(30) { return; }
+            if shell.options.debug_query.is_some() || shell.options.debug_window.is_some() || shell.options.debug_setup { return; }
+            let views = app.webview_windows();
+            if views.values().any(|view| view.is_visible().unwrap_or(true)) { return; }
+            for view in views.values() {
+                // Destroy alone leaves WebKit's process cache resident. All pages are hidden here,
+                // so terminating shared web processes cannot interrupt a visible page.
+                #[cfg(target_os = "linux")]
+                let _ = view.with_webview(|webview| {
+                    use webkit2gtk::WebViewExt;
+                    webview.inner().terminate_web_process();
+                });
+                let _ = view.destroy();
+            }
+        });
+    });
+}
+
+#[tauri::command]
 fn set_center_panel(app: AppHandle, shell: State<'_, Arc<Shell>>, on: bool) -> Result<(), String> {
     {
         let mut settings = shell.settings.lock().unwrap();
@@ -1858,6 +1930,9 @@ fn model_event(app: &AppHandle, event: Value) {
         println!("model: {event}");
     }
     let shell = app.state::<Arc<Shell>>().inner().clone();
+    if shell.quitting.load(Ordering::SeqCst) {
+        return;
+    }
     let before = shell.model_state.lock().unwrap().clone();
     let state = match event["event"].as_str().unwrap_or_default() {
         "progress" => {

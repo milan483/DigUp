@@ -53,6 +53,16 @@
         </span>
       </label>
 
+      <label class="option" id="warm-option" hidden>
+        <input type="checkbox" id="warm">
+        <span class="text">
+          <span class="name">Keep search ready in memory</span>
+          <span class="info">Uses more memory for faster repeat searches. Off by default on Linux: idle search workers
+            exit, and after all windows are hidden or closed for 30 seconds their pages are released. Reopening reloads them;
+            indexing continues independently.</span>
+        </span>
+      </label>
+
       <h3>The shortcut</h3>
       <div class="keys" id="keys"></div>
       <button class="link" id="change-shortcut" hidden>Change Shortcut…</button>

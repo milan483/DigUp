@@ -48,6 +48,8 @@ function renderGeneral() {
   $("center-option").hidden = !info.canCenter;
   $("center").checked = info.centered;
   $("processor").checked = info.processorOnly;
+  $("warm-option").hidden = !info.canKeepWarm;
+  $("warm").checked = info.keepWarm;
   $("keys").replaceChildren(...info.hotkey.split("+").filter(Boolean).map((key) => element("span", "key", key)));
   const note = notes[info.shortcut.method];
   $("shortcut-note").hidden = !note;
@@ -105,6 +107,7 @@ function wire(box, command) {
 wire($("login"), "set_open_at_login");
 wire($("center"), "set_center_panel");
 wire($("processor"), "set_processor_only");
+wire($("warm"), "set_keep_warm");
 wire($("update-checks"), "set_update_checks");
 for (const choice of document.querySelectorAll('input[name="tray-click"]')) {
   choice.addEventListener("change", () => {
