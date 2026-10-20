@@ -597,7 +597,9 @@ fn later(app: &AppHandle, work: impl FnOnce(&AppHandle) + Send + 'static) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let main = handle.clone();
-        let _ = handle.run_on_main_thread(move || work(&main));
+        if let Err(error) = handle.run_on_main_thread(move || work(&main)) {
+            eprintln!("digup-shell: can't dispatch UI work: {error}");
+        }
     });
 }
 
@@ -1048,6 +1050,12 @@ fn remake_panel(app: &AppHandle) {
 }
 
 fn show_panel(app: &AppHandle) {
+    later(app, show_panel_on_main);
+}
+
+/// Only called inside the main-thread transaction. Never retain a window handle across dispatch:
+/// idle cleanup may destroy it before the queued show runs (D-Bus and KDE activate off-main).
+fn show_panel_on_main(app: &AppHandle) {
     if app.state::<Arc<Shell>>().quitting.load(Ordering::SeqCst) { return; }
     if !app.state::<Arc<Shell>>().is_set_up() {
         later(app, |app| {
@@ -1074,7 +1082,10 @@ fn show_panel(app: &AppHandle) {
             let _ = panel.set_position(PhysicalPosition::new(x, y));
         }
     }
-    let _ = panel.show();
+    if let Err(error) = panel.show() {
+        eprintln!("digup-shell: can't show the panel: {error}");
+        return;
+    }
     let _ = panel.set_focus();
     let _ = panel.emit("panel-shown", ());
     if cfg!(debug_assertions) {
@@ -1083,10 +1094,13 @@ fn show_panel(app: &AppHandle) {
 }
 
 fn toggle_panel(app: &AppHandle) {
-    match panel_window(app) {
-        Some(panel) if panel.is_visible().unwrap_or(false) => hide_panel(app.clone()),
-        _ => show_panel(app),
-    }
+    later(app, |app| {
+        // Lookup, visibility decision, creation and show are indivisible with respect to cleanup.
+        match panel_window(app) {
+            Some(panel) if panel.is_visible().unwrap_or(false) => hide_panel(app.clone()),
+            _ => show_panel_on_main(app),
+        }
+    });
 }
 
 /// The window: searches bigger than the panel (kind filters, a grid of pictures, the preview beside it), the home
@@ -2056,6 +2070,24 @@ fn reload(app: &AppHandle, now: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panel_activation_dispatches_before_lookup() {
+        // Structural regression guard for off-main D-Bus/KDE callbacks. A dispatch of
+        // show() alone is insufficient: lookup/visibility/creation must be in that same
+        // closure as well. The graphical fixture exercises actual cleanup-boundary searches.
+        let source = include_str!("main.rs");
+        let show = source.split("fn show_panel(app:").nth(1).unwrap()
+            .split("fn show_panel_on_main(").next().unwrap();
+        assert!(show.contains("later(app, show_panel_on_main)"));
+        assert!(!show.contains("panel_window(app)"));
+        let toggle = source.split("fn toggle_panel(app:").nth(1).unwrap()
+            .split("/// The window:").next().unwrap();
+        let dispatch = toggle.find("later(app, |app|").unwrap();
+        assert!(dispatch < toggle.find("panel_window(app)").unwrap());
+        assert!(toggle.contains("_ => show_panel_on_main(app)"));
+        assert!(!toggle.contains("_ => show_panel(app)"));
+    }
+
     #[test]
     fn login_entry_exec_is_replaced() {
         let entry = "[Desktop Entry]\nType=Application\nExec=/home/me/.local/opt/digup/usr/bin/digup-shell --at-login\nName=DigUp\n";

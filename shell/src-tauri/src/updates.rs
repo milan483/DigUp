@@ -69,6 +69,7 @@ impl Updates {
 
 /// The Windows installer and the AppImage replace themselves; a .deb, or a build that no installer put there, doesn't.
 pub fn installs_itself() -> bool {
+    if cfg!(feature = "fork-no-updates") { return false; }
     match tauri::utils::platform::bundle_type() {
         Some(BundleType::Nsis) => true,
         Some(BundleType::AppImage) => std::env::var_os("APPIMAGE").is_some(),
@@ -108,6 +109,7 @@ fn log(shell: &Shell, line: &str) {
 /// the last check. Not in dev runs or debug builds (they'd read the real feed), unless `--debug-update-check` asks for
 /// one check at once (then `--debug-update-install` takes what it finds without asking).
 pub fn start(app: &AppHandle) {
+    if cfg!(feature = "fork-no-updates") { return; }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     log(&shell, &format!("DigUp {} started", app.package_info().version));
     let debug = shell.options.debug_update_check;
@@ -136,6 +138,12 @@ pub fn start(app: &AppHandle) {
 /// Reads the feed. `asked`: the person chose Check for Updates…, and hears the answer (an update is then offered at
 /// once); a daily check stays quiet and lets an update wait.
 pub async fn check(app: &AppHandle, asked: bool) {
+    if cfg!(feature = "fork-no-updates") {
+        if asked {
+            tell(app, "DigUp low-memory fork", "Upstream updates are disabled in this fork. Download fork builds manually from milan483/DigUp.");
+        }
+        return;
+    }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     {
         let mut phase = shell.updates.phase.lock().unwrap();
@@ -199,6 +207,7 @@ pub async fn check(app: &AppHandle, asked: bool) {
 
 /// "Update to DigUp X…": what's new, then Install and Restart (or, for a .deb, the release page to download it from).
 pub fn offer(app: &AppHandle) {
+    if cfg!(feature = "fork-no-updates") { return; }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     let Some(update) = shell.updates.found.lock().unwrap().clone() else { return };
     if *shell.updates.phase.lock().unwrap() != Phase::Idle {
@@ -238,6 +247,7 @@ pub fn offer(app: &AppHandle) {
 /// Downloads the update, checks its signature, installs it and starts DigUp again (on Windows the installer starts it:
 /// DigUp exits as the installer begins).
 pub async fn install(app: &AppHandle) {
+    if cfg!(feature = "fork-no-updates") { return; }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     let Some(update) = shell.updates.found.lock().unwrap().clone() else { return };
     if !installs_itself() {
@@ -317,6 +327,12 @@ fn release_page(download: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "fork-no-updates")]
+    fn fork_never_installs_upstream_updates() {
+        assert!(!installs_itself());
+    }
 
     #[test]
     fn release_pages() {

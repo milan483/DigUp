@@ -5,6 +5,10 @@ description = "DigUp for Windows and Linux: the tray icon, the hotkey and the se
 edition = "2021"
 publish = false
 
+[features]
+# Fork packages must not fetch or install upstream releases, regardless of user settings/debug flags.
+fork-no-updates = []
+
 [build-dependencies]
 tauri-build = { version = "2.7.2", features = [] }
 

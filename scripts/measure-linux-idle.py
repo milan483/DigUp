@@ -13,6 +13,30 @@ import tempfile
 import time
 
 
+def visible_window(pid):
+    windows = subprocess.check_output(['xdotool', 'search', '--all', '--onlyvisible',
+                                       '--pid', str(pid), '--name', '^DigUp$'], text=True).split()
+    assert len(windows) == 1, f'expected one visible window: {windows}'
+    return windows[0]
+
+
+def search_response(pid, root, query):
+    window = visible_window(pid)
+    subprocess.run(['xdotool', 'windowactivate', '--sync', window, 'key', '--clearmodifiers', 'ctrl+a',
+                    'type', '--clearmodifiers', query], check=True)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        replies = root / 'search-replies.jsonl'
+        for line in replies.read_text().splitlines() if replies.exists() else []:
+            reply = json.loads(line)
+            if reply['query'] == query:
+                assert reply['response'].get('ok') is not False, reply
+                assert isinstance(reply['response'].get('hits'), list), reply
+                return reply
+        time.sleep(0.1)
+    raise AssertionError(f'no successful frontend search response for {query}')
+
+
 def snapshot(pid):
     processes = {}
     for path in Path('/proc').glob('[0-9]*/status'):
@@ -46,6 +70,7 @@ def main():
     binary, helper = (str(Path(arg).resolve()) for arg in sys.argv[1:3])
     temp = '/tmp/opencode' if Path('/tmp/opencode').is_dir() else None
     root = Path(tempfile.mkdtemp(prefix='digup-idle-', dir=temp))
+    print(f'Isolated fixture: {root}', file=sys.stderr, flush=True)
     env = dict(os.environ, HOME=str(root), XDG_CONFIG_HOME=str(root / 'config'),
                XDG_DATA_HOME=str(root / 'data'), XDG_CACHE_HOME=str(root / 'cache'),
                XDG_STATE_HOME=str(root / 'state'), DIGUP_MODELS=str(root / 'models'),
@@ -53,12 +78,39 @@ def main():
                XDG_CURRENT_DESKTOP='', NO_AT_BRIDGE='1', DIGUP_TEST_HELPER=helper)
     env.pop('WAYLAND_DISPLAY', None)
     wrapper = root / 'helper'
-    wrapper.write_text('''#!/bin/sh
-case "$1" in
-download-model) echo '{"event":"error","message":"isolated test: downloads disabled"}'; exit 0;;
-speed) echo '{}'; exit 0;;
-esac
-exec "$DIGUP_TEST_HELPER" "$@"
+    # Proxy only search-service, recording actual request/reply pairs rather than inferring
+    # successful search from a live worker. The real bundled engine still answers every request.
+    # AppRun exports its bundled Python paths. The system-Python test proxy must
+    # ignore those paths without stripping the packaged real helper's environment.
+    wrapper.write_text('#!' + sys.executable + ' -E\n' + '''import json, os, subprocess, sys, threading
+from pathlib import Path
+if sys.argv[1] == 'download-model':
+    print('{"event":"error","message":"isolated test: downloads disabled"}')
+    sys.exit(0)
+if sys.argv[1] == 'speed':
+    print('{}')
+    sys.exit(0)
+if sys.argv[1] != 'search-service':
+    os.execv(os.environ['DIGUP_TEST_HELPER'], [os.environ['DIGUP_TEST_HELPER'], *sys.argv[1:]])
+child = subprocess.Popen([os.environ['DIGUP_TEST_HELPER'], *sys.argv[1:]],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+requests = {}
+def send():
+    for line in sys.stdin:
+        request = json.loads(line)
+        requests[request.get('id')] = request
+        child.stdin.write(line)
+        child.stdin.flush()
+    child.stdin.close()
+threading.Thread(target=send, daemon=True).start()
+for line in child.stdout:
+    response = json.loads(line)
+    request = requests.pop(response.get('id'), {})
+    if request.get('op') == 'search':
+        with (Path(os.environ['HOME']) / 'search-replies.jsonl').open('a') as log:
+            log.write(json.dumps({'query': request.get('q'), 'response': response}) + '\\n')
+    print(line, end='', flush=True)
+sys.exit(child.wait())
 ''')
     wrapper.chmod(0o755)
     results = {'fixture': str(root), 'modes': {}}
@@ -81,7 +133,19 @@ exec "$DIGUP_TEST_HELPER" "$@"
                 time.sleep(6)
                 reopened = snapshot(app.pid)
                 results['modes'][str(warm)] = {'opened': opened, 'idle': idle, 'reopened': reopened}
+                results['modes'][str(warm)]['postReopenSearch'] = search_response(
+                    app.pid, root, f'reopen-{warm}')
                 if not warm:
+                    # Exercise both sides of the 30s hidden-page cleanup boundary. D-Bus
+                    # activation is off-main; each activation must survive cleanup and answer.
+                    boundary = []
+                    for number, delay in enumerate((29.8, 30.2, 35.1)):
+                        subprocess.run(args + ['--toggle'], env=env, check=True, timeout=15)
+                        time.sleep(delay)
+                        subprocess.run(args + ['--toggle'], env=env, check=True, timeout=15)
+                        time.sleep(2)
+                        boundary.append(search_response(app.pid, root, f'boundary-{number}'))
+                    results['modes'][str(warm)]['cleanupBoundarySearches'] = boundary
                     # Normal desktop activation opens the main window, not the panel. Closing that
                     # window must also release its cached WebKit process, then support activation again.
                     subprocess.run(args + ['--toggle'], env=env, check=True, timeout=15)
@@ -104,6 +168,8 @@ exec "$DIGUP_TEST_HELPER" "$@"
                     main_reopened = snapshot(app.pid)
                     assert any('WebKitWeb' in row['name'] for row in main_reopened['processes']), 'main window did not reopen'
                     results['modes'][str(warm)].update(mainIdle=main_idle, mainReopened=main_reopened)
+                    results['modes'][str(warm)]['mainReopenSearch'] = search_response(
+                        app.pid, root, 'main-reopen')
             finally:
                 app.terminate()
                 try:
@@ -112,11 +178,35 @@ exec "$DIGUP_TEST_HELPER" "$@"
                     app.kill()
                     app.wait()
         # The frontend's existing debug-report command invokes the same quit() as GUI Quit, not SIGTERM.
-        quit_run = subprocess.run(args + ['--debug-window', '', '--debug-quit'], env=env,
-                                  capture_output=True, text=True, timeout=45)
-        (root / f'quit-{warm}.log').write_text(quit_run.stdout + quit_run.stderr)
-        assert quit_run.returncode == 0 and quit_run.stdout.strip(), 'frontend quit path failed'
-        results['modes'][str(warm)]['frontendQuitExit'] = quit_run.returncode
+        with (root / f'quit-{warm}.log').open('w') as log:
+            quit_app = subprocess.Popen(args + ['--debug-window', f'quit-{warm}', '--debug-quit'],
+                                        env=env, stdout=log, stderr=log)
+            tracked = set()
+            deadline = time.monotonic() + 45
+            while quit_app.poll() is None and time.monotonic() < deadline:
+                tracked.update(row['pid'] for row in snapshot(quit_app.pid)['processes'])
+                time.sleep(0.05)
+            try:
+                assert quit_app.wait(timeout=1) == 0, 'frontend quit path failed'
+            finally:
+                if quit_app.poll() is None:
+                    quit_app.kill()
+                    quit_app.wait()
+            report = (root / f'quit-{warm}.log').read_text()
+            assert any(json.loads(line).get('query') == f'quit-{warm}'
+                       for line in report.splitlines() if line.startswith('{')), report
+            assert any(reply['query'] == f'quit-{warm}'
+                       and reply['response'].get('ok') is not False
+                       and isinstance(reply['response'].get('hits'), list)
+                       for reply in map(json.loads, (root / 'search-replies.jsonl').read_text().splitlines())), \
+                'frontend Quit did not follow a successful real engine reply'
+            deadline = time.monotonic() + 10
+            while any(Path(f'/proc/{pid}').exists() for pid in tracked) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            remaining = [pid for pid in tracked if Path(f'/proc/{pid}').exists()]
+            assert not remaining, f'descendants survived actual frontend Quit: {remaining}'
+            results['modes'][str(warm)].update(frontendQuitExit=quit_app.returncode,
+                                              quitTrackedPids=sorted(tracked), quitSurvivors=remaining)
     (root / 'results.json').write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2), flush=True)
     cold = results['modes']['False']
